@@ -29,10 +29,12 @@ app.get('/', (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
+    const status = whatsappService.getStatus();
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        whatsapp: status
     });
 });
 
@@ -48,38 +50,52 @@ app.use((err, req, res, next) => {
 // Start server
 async function startServer() {
     try {
-        // Initialize WhatsApp
-        await whatsappService.initialize();
+        console.log('🚀 Starting WhatsApp Listener...');
+        console.log('📦 Environment:', process.env.NODE_ENV || 'development');
+        
+        // Initialize WhatsApp with a delay to ensure database connection
+        setTimeout(async () => {
+            try {
+                await whatsappService.initialize();
+            } catch (error) {
+                console.error('❌ WhatsApp initialization error:', error.message);
+            }
+        }, 2000);
 
         // Set up event handlers
         whatsappService.on('qr', (qr) => {
-            console.log('📱 QR Code generated');
+            console.log('📱 QR Code generated - Scan with WhatsApp');
         });
 
         whatsappService.on('ready', (sock) => {
-            console.log('✅ WhatsApp is ready');
+            console.log('✅ WhatsApp is ready and connected!');
         });
 
         whatsappService.on('message', async (msg, sock) => {
-            console.log('💬 New message:', msg);
+            console.log('💬 New message from:', msg.key.remoteJid);
             
-            // Auto-reply logic
             try {
                 const from = msg.key.remoteJid;
                 const messageText = msg.message?.conversation || 
                                    msg.message?.extendedTextMessage?.text || 
                                    '';
                 
-                // Handle auto-replies
+                // Auto-reply logic
                 if (messageText.toLowerCase() === 'ping') {
                     await sock.sendMessage(from, { text: 'Pong! 🏓' });
+                    console.log('✅ Auto-replied pong to:', from);
                 } else if (messageText.toLowerCase() === 'help') {
                     await sock.sendMessage(from, { 
-                        text: 'Available commands:\n- ping: Get pong\n- help: Show this message\n- status: Check bot status'
+                        text: '🤖 Available commands:\n\n• ping - Get pong response\n• help - Show this message\n• status - Check bot status\n• info - Get bot information'
                     });
                 } else if (messageText.toLowerCase() === 'status') {
+                    const status = whatsappService.getStatus();
                     await sock.sendMessage(from, { 
-                        text: `Bot is running!\nConnected: ${whatsappService.isConnected}\nSession: ${whatsappService.connectionStatus}`
+                        text: `📊 Bot Status:\n• Connected: ${status.isConnected}\n• Status: ${status.status}\n• Uptime: ${Math.floor(process.uptime())}s`
+                    });
+                } else if (messageText.toLowerCase() === 'info') {
+                    await sock.sendMessage(from, {
+                        text: '🤖 WhatsApp Listener Bot\nVersion: 1.0.0\nMade with ❤️ using Baileys'
                     });
                 }
             } catch (error) {
@@ -90,11 +106,11 @@ async function startServer() {
         whatsappService.on('call', async (call, sock) => {
             console.log('📞 Call from:', call.from);
             
-            // Auto-reply to calls
             try {
                 await sock.sendMessage(call.from, { 
-                    text: '📞 I am currently unavailable for calls. Please send a message instead.' 
+                    text: '📞 Sorry, I am currently unavailable for calls. Please send a message instead. Thank you!'
                 });
+                console.log('✅ Auto-replied to call from:', call.from);
             } catch (error) {
                 console.error('Error handling call:', error);
             }
@@ -105,11 +121,21 @@ async function startServer() {
         });
 
         // Start Express server
-        app.listen(port, () => {
+        const server = app.listen(port, () => {
             console.log(`🚀 Server running on port ${port}`);
             console.log(`🌐 Web interface: http://localhost:${port}`);
             console.log(`📱 QR API: http://localhost:${port}/api/qr`);
             console.log(`📊 Status API: http://localhost:${port}/api/status`);
+            console.log(`❤️ Health check: http://localhost:${port}/health`);
+        });
+
+        // Handle server errors
+        server.on('error', (error) => {
+            if (error.code === 'EADDRINUSE') {
+                console.error(`❌ Port ${port} is already in use`);
+                process.exit(1);
+            }
+            console.error('❌ Server error:', error);
         });
 
     } catch (error) {
@@ -121,8 +147,12 @@ async function startServer() {
 // Graceful shutdown
 async function shutdown() {
     console.log('\n🛑 Shutting down gracefully...');
-    await whatsappService.disconnect();
-    await whatsappService.sessionStore.disconnect();
+    try {
+        await whatsappService.disconnect();
+        await whatsappService.sessionStore.disconnect();
+    } catch (error) {
+        console.error('Error during shutdown:', error);
+    }
     process.exit(0);
 }
 
@@ -131,6 +161,9 @@ process.on('SIGTERM', shutdown);
 process.on('uncaughtException', (error) => {
     console.error('❌ Uncaught exception:', error);
     shutdown();
+});
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Unhandled rejection at:', promise, 'reason:', reason);
 });
 
 startServer();

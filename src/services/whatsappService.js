@@ -12,6 +12,7 @@ class WhatsAppService {
     this.qrCode = null;
     this.sessionData = null;
     this.connectionStatus = 'disconnected';
+    this.isInitializing = false;
     this.events = {
       onQR: null,
       onReady: null,
@@ -23,32 +24,54 @@ class WhatsAppService {
 
   async initialize() {
     try {
+      // Prevent multiple initializations
+      if (this.isInitializing) {
+        console.log('⚠️ Already initializing...');
+        return this.sock;
+      }
+      
+      this.isInitializing = true;
+      console.log('🔄 Initializing WhatsApp...');
+      
       await this.sessionStore.connect();
       const savedSession = await this.sessionStore.loadSession();
       
+      console.log('📂 Loading session...');
+      
       const logger = pino({ level: 'silent' });
+      
+      // Create socket with proper authentication
+      const auth = savedSession ? {
+        creds: savedSession.creds || {},
+        keys: savedSession.keys || {}
+      } : undefined;
       
       this.sock = makeWASocket({
         logger: logger,
-        printQRInTerminal: false,
-        auth: {
-          creds: savedSession?.creds || {},
-          keys: savedSession?.keys || {}
-        },
+        printQRInTerminal: true,
+        auth: auth,
         browser: ['WhatsApp Listener', 'Chrome', '1.0.0'],
         syncFullHistory: false,
-        markOnlineOnConnect: false
+        markOnlineOnConnect: false,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 60000
       });
 
       this.setupEventListeners();
+      this.isInitializing = false;
+      
+      console.log('✅ WhatsApp socket created');
       return this.sock;
     } catch (error) {
+      this.isInitializing = false;
       console.error('❌ Failed to initialize WhatsApp:', error);
       throw error;
     }
   }
 
   setupEventListeners() {
+    if (!this.sock) return;
+
     this.sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
@@ -58,6 +81,7 @@ class WhatsAppService {
         console.log('📱 Scan QR Code:');
         QRCode.generate(qr, { small: true });
         
+        // Emit QR event
         if (this.events.onQR) {
           this.events.onQR(qr);
         }
@@ -73,13 +97,20 @@ class WhatsAppService {
       if (connection === 'open') {
         this.isConnected = true;
         this.connectionStatus = 'connected';
+        this.qrCode = null;
         console.log('✅ WhatsApp Connected Successfully');
         
-        const authState = this.sock.authState;
-        await this.sessionStore.saveSession({
-          creds: authState.creds,
-          keys: authState.keys
-        });
+        // Save session after successful connection
+        try {
+          const authState = this.sock.authState;
+          await this.sessionStore.saveSession({
+            creds: authState.creds,
+            keys: authState.keys
+          });
+          console.log('💾 Session saved to database');
+        } catch (error) {
+          console.error('❌ Failed to save session:', error);
+        }
         
         if (this.events.onReady) {
           this.events.onReady(this.sock);
@@ -94,14 +125,13 @@ class WhatsAppService {
 
       if (connection === 'close') {
         this.isConnected = false;
-        this.connectionStatus = 'disconnected';
         console.log('⚠️ Connection closed');
         
         const shouldReconnect = (lastDisconnect?.error instanceof Boom) && 
           lastDisconnect.error.output.statusCode !== 401;
         
         if (shouldReconnect) {
-          console.log('🔄 Attempting to reconnect...');
+          console.log('🔄 Attempting to reconnect in 5 seconds...');
           this.connectionStatus = 'reconnecting';
           
           if (this.events.onConnectionUpdate) {
@@ -116,7 +146,6 @@ class WhatsAppService {
         } else {
           console.log('❌ Permanent disconnection. Please restart.');
           this.connectionStatus = 'permanent_disconnect';
-          await this.sessionStore.deleteSession();
           
           if (this.events.onConnectionUpdate) {
             this.events.onConnectionUpdate({
@@ -170,7 +199,7 @@ class WhatsAppService {
 
   async sendMessage(jid, content) {
     try {
-      if (!this.isConnected) {
+      if (!this.isConnected || !this.sock) {
         throw new Error('Not connected to WhatsApp');
       }
       
@@ -190,7 +219,7 @@ class WhatsAppService {
 
   async sendPresenceUpdate(jid, presence) {
     try {
-      if (!this.isConnected) {
+      if (!this.isConnected || !this.sock) {
         throw new Error('Not connected to WhatsApp');
       }
       
@@ -204,6 +233,10 @@ class WhatsAppService {
 
   async readMessage(jid, messageId) {
     try {
+      if (!this.isConnected || !this.sock) {
+        throw new Error('Not connected to WhatsApp');
+      }
+      
       await this.sock.readMessages([
         { remoteJid: jid, id: messageId }
       ]);
@@ -225,11 +258,16 @@ class WhatsAppService {
   }
 
   async disconnect() {
-    if (this.sock) {
-      await this.sock.end();
+    try {
+      if (this.sock) {
+        await this.sock.end();
+      }
       this.isConnected = false;
       this.connectionStatus = 'disconnected';
+      this.qrCode = null;
       console.log('🔌 Disconnected from WhatsApp');
+    } catch (error) {
+      console.error('❌ Error disconnecting:', error);
     }
   }
 

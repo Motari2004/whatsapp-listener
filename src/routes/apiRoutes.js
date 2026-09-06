@@ -2,38 +2,110 @@ const express = require('express');
 const router = express.Router();
 
 module.exports = (whatsappService) => {
+  // Connect WhatsApp
+  router.post('/connect', async (req, res) => {
+    try {
+      console.log('🔄 Connect request received');
+      
+      // Check if already connected
+      const status = whatsappService.getStatus();
+      if (status.isConnected) {
+        return res.json({
+          success: true,
+          message: 'Already connected to WhatsApp',
+          status: 'connected'
+        });
+      }
+
+      // Initialize WhatsApp connection
+      await whatsappService.initialize();
+      
+      // Wait a bit for QR to generate
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      const newStatus = whatsappService.getStatus();
+      
+      res.json({
+        success: true,
+        message: 'WhatsApp connection initiated',
+        status: newStatus.status,
+        qrCode: newStatus.qrCode
+      });
+    } catch (error) {
+      console.error('❌ Connect error:', error);
+      res.status(500).json({
+        success: false,
+        error: error.message || 'Failed to connect to WhatsApp'
+      });
+    }
+  });
+
+  // Disconnect WhatsApp
+  router.post('/disconnect', async (req, res) => {
+    try {
+      console.log('🔌 Disconnect request received');
+      await whatsappService.disconnect();
+      res.json({
+        success: true,
+        message: 'Disconnected successfully'
+      });
+    } catch (error) {
+      console.error('❌ Disconnect error:', error);
+      res.status(500).json({
+        success: false,
+        error: error.message || 'Failed to disconnect'
+      });
+    }
+  });
+
   // Get QR Code
   router.get('/qr', (req, res) => {
-    const status = whatsappService.getStatus();
-    
-    if (status.status === 'connected') {
-      return res.json({
-        status: 'connected',
-        message: 'WhatsApp is already connected',
-        data: status
+    try {
+      const status = whatsappService.getStatus();
+      
+      if (status.isConnected) {
+        return res.json({
+          success: true,
+          status: 'connected',
+          message: 'WhatsApp is already connected'
+        });
+      }
+      
+      if (status.qrCode) {
+        return res.json({
+          success: true,
+          status: 'qr_required',
+          qrCode: status.qrCode,
+          message: 'Scan QR code to connect'
+        });
+      }
+      
+      res.json({
+        success: true,
+        status: 'pending',
+        message: 'Waiting for QR code...'
+      });
+    } catch (error) {
+      console.error('❌ QR error:', error);
+      res.status(500).json({
+        success: false,
+        error: error.message
       });
     }
-    
-    if (status.status === 'qr_required' && status.qrCode) {
-      return res.json({
-        status: 'qr_required',
-        message: 'Scan QR code to connect',
-        qrCode: status.qrCode,
-        data: status
-      });
-    }
-    
-    res.json({
-      status: 'pending',
-      message: 'Waiting for QR code to be generated...',
-      data: status
-    });
   });
 
   // Get connection status
   router.get('/status', (req, res) => {
-    const status = whatsappService.getStatus();
-    res.json(status);
+    try {
+      const status = whatsappService.getStatus();
+      res.json(status);
+    } catch (error) {
+      console.error('❌ Status error:', error);
+      res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    }
   });
 
   // Get all sessions (for debugging)
@@ -45,6 +117,7 @@ module.exports = (whatsappService) => {
         sessions: sessions
       });
     } catch (error) {
+      console.error('❌ Sessions error:', error);
       res.status(500).json({
         success: false,
         error: error.message
@@ -61,6 +134,15 @@ module.exports = (whatsappService) => {
         return res.status(400).json({
           success: false,
           error: 'Missing required fields: to, message'
+        });
+      }
+
+      // Check if connected
+      const status = whatsappService.getStatus();
+      if (!status.isConnected) {
+        return res.status(400).json({
+          success: false,
+          error: 'WhatsApp is not connected. Please connect first.'
         });
       }
 
@@ -98,9 +180,10 @@ module.exports = (whatsappService) => {
         data: result
       });
     } catch (error) {
+      console.error('❌ Send message error:', error);
       res.status(500).json({
         success: false,
-        error: error.message
+        error: error.message || 'Failed to send message'
       });
     }
   });
@@ -114,6 +197,15 @@ module.exports = (whatsappService) => {
         return res.status(400).json({
           success: false,
           error: 'Missing required fields: numbers (array), message'
+        });
+      }
+
+      // Check if connected
+      const status = whatsappService.getStatus();
+      if (!status.isConnected) {
+        return res.status(400).json({
+          success: false,
+          error: 'WhatsApp is not connected. Please connect first.'
         });
       }
 
@@ -141,9 +233,10 @@ module.exports = (whatsappService) => {
         results
       });
     } catch (error) {
+      console.error('❌ Broadcast error:', error);
       res.status(500).json({
         success: false,
-        error: error.message
+        error: error.message || 'Failed to send broadcast'
       });
     }
   });
@@ -158,6 +251,7 @@ module.exports = (whatsappService) => {
         message: 'Session deleted successfully'
       });
     } catch (error) {
+      console.error('❌ Delete session error:', error);
       res.status(500).json({
         success: false,
         error: error.message

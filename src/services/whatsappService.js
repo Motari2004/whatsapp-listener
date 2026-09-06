@@ -1,4 +1,5 @@
 const makeWASocket = require('@whiskeysockets/baileys').default;
+const { useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode-terminal');
 const pino = require('pino');
 const { Boom } = require('@hapi/boom');
@@ -10,9 +11,10 @@ class WhatsAppService {
     this.sessionStore = new SessionStore();
     this.isConnected = false;
     this.qrCode = null;
-    this.sessionData = null;
     this.connectionStatus = 'disconnected';
     this.isInitializing = false;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 10;
     this.events = {
       onQR: null,
       onReady: null,
@@ -24,7 +26,6 @@ class WhatsAppService {
 
   async initialize() {
     try {
-      // Prevent multiple initializations
       if (this.isInitializing) {
         console.log('⚠️ Already initializing...');
         return this.sock;
@@ -40,21 +41,17 @@ class WhatsAppService {
       
       const logger = pino({ level: 'silent' });
       
-      // Create socket with proper authentication
-      const auth = savedSession ? {
-        creds: savedSession.creds || {},
-        keys: savedSession.keys || {}
-      } : undefined;
-      
+      // Create socket with proper configuration
       this.sock = makeWASocket({
         logger: logger,
         printQRInTerminal: true,
-        auth: auth,
+        auth: savedSession || undefined,
         browser: ['WhatsApp Listener', 'Chrome', '1.0.0'],
         syncFullHistory: false,
-        markOnlineOnConnect: false,
-        connectTimeoutMs: 60000,
-        defaultQueryTimeoutMs: 60000
+        markOnlineOnConnect: true,
+        connectTimeoutMs: 30000,
+        defaultQueryTimeoutMs: 30000,
+        keepAliveIntervalMs: 10000
       });
 
       this.setupEventListeners();
@@ -81,7 +78,6 @@ class WhatsAppService {
         console.log('📱 Scan QR Code:');
         QRCode.generate(qr, { small: true });
         
-        // Emit QR event
         if (this.events.onQR) {
           this.events.onQR(qr);
         }
@@ -98,9 +94,10 @@ class WhatsAppService {
         this.isConnected = true;
         this.connectionStatus = 'connected';
         this.qrCode = null;
+        this.reconnectAttempts = 0;
         console.log('✅ WhatsApp Connected Successfully');
         
-        // Save session after successful connection
+        // Save session
         try {
           const authState = this.sock.authState;
           await this.sessionStore.saveSession({
@@ -125,46 +122,58 @@ class WhatsAppService {
 
       if (connection === 'close') {
         this.isConnected = false;
-        console.log('⚠️ Connection closed');
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         
-        const shouldReconnect = (lastDisconnect?.error instanceof Boom) && 
-          lastDisconnect.error.output.statusCode !== 401;
+        console.log(`⚠️ Connection closed. Status code: ${statusCode}`);
         
-        if (shouldReconnect) {
-          console.log('🔄 Attempting to reconnect in 5 seconds...');
+        if (shouldReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
+          this.reconnectAttempts++;
+          const delay = Math.min(5000 * this.reconnectAttempts, 30000);
+          console.log(`🔄 Reconnecting attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay/1000}s...`);
+          
           this.connectionStatus = 'reconnecting';
           
           if (this.events.onConnectionUpdate) {
             this.events.onConnectionUpdate({
-              status: 'reconnecting'
+              status: 'reconnecting',
+              attempts: this.reconnectAttempts
             });
           }
           
           setTimeout(() => {
             this.initialize();
-          }, 5000);
+          }, delay);
         } else {
-          console.log('❌ Permanent disconnection. Please restart.');
-          this.connectionStatus = 'permanent_disconnect';
+          console.log('❌ Permanent disconnection.');
+          this.connectionStatus = 'disconnected';
+          this.qrCode = null;
+          
+          if (statusCode === DisconnectReason.loggedOut) {
+            console.log('📱 Logged out. Please scan QR code again.');
+            await this.sessionStore.deleteSession();
+          }
           
           if (this.events.onConnectionUpdate) {
             this.events.onConnectionUpdate({
-              status: 'permanent_disconnect'
+              status: 'disconnected',
+              reason: statusCode
             });
           }
         }
       }
     });
 
+    // Handle messages
     this.sock.ev.on('messages.upsert', async ({ messages }) => {
-      const msg = messages[0];
-      if (!msg.key.fromMe) {
-        if (this.events.onMessage) {
+      for (const msg of messages) {
+        if (!msg.key.fromMe && this.events.onMessage) {
           await this.events.onMessage(msg, this.sock);
         }
       }
     });
 
+    // Handle calls
     this.sock.ev.on('call', async (calls) => {
       for (const call of calls) {
         console.log('📞 Incoming call from:', call.from);
@@ -172,6 +181,16 @@ class WhatsAppService {
           await this.events.onCall(call, this.sock);
         }
       }
+    });
+
+    // Handle presence updates
+    this.sock.ev.on('presence.update', (update) => {
+      // console.log('👤 Presence update:', update);
+    });
+
+    // Handle read receipts
+    this.sock.ev.on('messages.receipt', (receipt) => {
+      // console.log('✓ Read receipt:', receipt);
     });
   }
 
@@ -203,7 +222,6 @@ class WhatsAppService {
         throw new Error('Not connected to WhatsApp');
       }
       
-      // Ensure JID format
       if (!jid.includes('@')) {
         jid = `${jid}@s.whatsapp.net`;
       }
@@ -217,42 +235,13 @@ class WhatsAppService {
     }
   }
 
-  async sendPresenceUpdate(jid, presence) {
-    try {
-      if (!this.isConnected || !this.sock) {
-        throw new Error('Not connected to WhatsApp');
-      }
-      
-      await this.sock.sendPresenceUpdate(presence, jid);
-      return true;
-    } catch (error) {
-      console.error('❌ Failed to send presence update:', error);
-      return false;
-    }
-  }
-
-  async readMessage(jid, messageId) {
-    try {
-      if (!this.isConnected || !this.sock) {
-        throw new Error('Not connected to WhatsApp');
-      }
-      
-      await this.sock.readMessages([
-        { remoteJid: jid, id: messageId }
-      ]);
-      return true;
-    } catch (error) {
-      console.error('❌ Failed to read message:', error);
-      return false;
-    }
-  }
-
   getStatus() {
     return {
       isConnected: this.isConnected,
       status: this.connectionStatus,
       qrCode: this.qrCode,
-      sessionExists: !!this.sessionData,
+      sessionExists: !!this.sock?.authState?.creds,
+      reconnectAttempts: this.reconnectAttempts,
       timestamp: new Date().toISOString()
     };
   }
@@ -261,10 +250,12 @@ class WhatsAppService {
     try {
       if (this.sock) {
         await this.sock.end();
+        this.sock = null;
       }
       this.isConnected = false;
       this.connectionStatus = 'disconnected';
       this.qrCode = null;
+      this.reconnectAttempts = 0;
       console.log('🔌 Disconnected from WhatsApp');
     } catch (error) {
       console.error('❌ Error disconnecting:', error);

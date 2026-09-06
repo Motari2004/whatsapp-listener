@@ -4,6 +4,8 @@ const QRCode = require('qrcode-terminal');
 const pino = require('pino');
 const { Boom } = require('@hapi/boom');
 const SessionStore = require('../database/sessionStore');
+const fs = require('fs');
+const path = require('path');
 
 class WhatsAppService {
   constructor() {
@@ -15,6 +17,7 @@ class WhatsAppService {
     this.isInitializing = false;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
+    this.authDir = path.join(__dirname, '../../auth_info');
     this.events = {
       onQR: null,
       onReady: null,
@@ -35,23 +38,60 @@ class WhatsAppService {
       console.log('🔄 Initializing WhatsApp...');
       
       await this.sessionStore.connect();
-      const savedSession = await this.sessionStore.loadSession();
       
-      console.log('📂 Loading session...');
+      // Create auth directory if it doesn't exist
+      if (!fs.existsSync(this.authDir)) {
+        fs.mkdirSync(this.authDir, { recursive: true });
+      }
+      
+      // Load saved session from database and save to file
+      const savedSession = await this.sessionStore.loadSession();
+      if (savedSession) {
+        console.log('📂 Loading session from database...');
+        // Write session to file for useMultiFileAuthState
+        const credsPath = path.join(this.authDir, 'creds.json');
+        const keysPath = path.join(this.authDir, 'keys.json');
+        
+        if (savedSession.creds) {
+          fs.writeFileSync(credsPath, JSON.stringify(savedSession.creds, null, 2));
+        }
+        if (savedSession.keys) {
+          fs.writeFileSync(keysPath, JSON.stringify(savedSession.keys, null, 2));
+        }
+      }
+      
+      // Use multi file auth state
+      const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
       
       const logger = pino({ level: 'silent' });
       
-      // Create socket with proper configuration
       this.sock = makeWASocket({
         logger: logger,
         printQRInTerminal: true,
-        auth: savedSession || undefined,
+        auth: state,
         browser: ['WhatsApp Listener', 'Chrome', '1.0.0'],
         syncFullHistory: false,
         markOnlineOnConnect: true,
         connectTimeoutMs: 30000,
         defaultQueryTimeoutMs: 30000,
         keepAliveIntervalMs: 10000
+      });
+
+      // Save creds when updated
+      this.sock.ev.on('creds.update', saveCreds);
+
+      // Also save to database when creds update
+      this.sock.ev.on('creds.update', async () => {
+        try {
+          const currentState = this.sock.authState;
+          await this.sessionStore.saveSession({
+            creds: currentState.creds,
+            keys: currentState.keys
+          });
+          console.log('💾 Session saved to database');
+        } catch (error) {
+          console.error('❌ Failed to save session:', error);
+        }
       });
 
       this.setupEventListeners();
@@ -97,18 +137,6 @@ class WhatsAppService {
         this.reconnectAttempts = 0;
         console.log('✅ WhatsApp Connected Successfully');
         
-        // Save session
-        try {
-          const authState = this.sock.authState;
-          await this.sessionStore.saveSession({
-            creds: authState.creds,
-            keys: authState.keys
-          });
-          console.log('💾 Session saved to database');
-        } catch (error) {
-          console.error('❌ Failed to save session:', error);
-        }
-        
         if (this.events.onReady) {
           this.events.onReady(this.sock);
         }
@@ -151,6 +179,10 @@ class WhatsAppService {
           
           if (statusCode === DisconnectReason.loggedOut) {
             console.log('📱 Logged out. Please scan QR code again.');
+            // Clean up auth files
+            if (fs.existsSync(this.authDir)) {
+              fs.rmSync(this.authDir, { recursive: true, force: true });
+            }
             await this.sessionStore.deleteSession();
           }
           
@@ -181,16 +213,6 @@ class WhatsAppService {
           await this.events.onCall(call, this.sock);
         }
       }
-    });
-
-    // Handle presence updates
-    this.sock.ev.on('presence.update', (update) => {
-      // console.log('👤 Presence update:', update);
-    });
-
-    // Handle read receipts
-    this.sock.ev.on('messages.receipt', (receipt) => {
-      // console.log('✓ Read receipt:', receipt);
     });
   }
 
@@ -240,7 +262,7 @@ class WhatsAppService {
       isConnected: this.isConnected,
       status: this.connectionStatus,
       qrCode: this.qrCode,
-      sessionExists: !!this.sock?.authState?.creds,
+      sessionExists: fs.existsSync(path.join(this.authDir, 'creds.json')),
       reconnectAttempts: this.reconnectAttempts,
       timestamp: new Date().toISOString()
     };

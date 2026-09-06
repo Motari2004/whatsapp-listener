@@ -1,24 +1,17 @@
 services:
   - type: web
     name: whatsapp-listener
-    env: node
-    buildCommand: npm install
-    startCommand: npm start
+    env: docker
+    plan: starter # persistent disks require a paid plan, not the free tier
+    disk:
+      name: whatsapp-session
+      mountPath: /data
+      sizeGB: 1
     envVars:
-      - key: NODE_VERSION
-        value: 18.17.0
-      - key: DATABASE_URL
-        sync: false
-      - key: SESSION_SECRET
-        sync: false
-      - key: PORT
-        value: 3000
-      - key: NODE_ENV
-        value: production
-    plan: free
-    autoDeploy: true
-    buildFilter:
-      paths:
-        - src/**/*.js
-        - package.json
-        - package-lock.json
+      - key: SESSION_PATH
+        value: /data/.wwebjs_auth
+      - key: DASHBOARD_TOKEN
+        sync: false # set this manually in the Render dashboard to a long random string
+      - key: WEBHOOK_URL
+        sync: false # optional, set manually if you want messages forwarded somewhere
+    healthCheckPath: /health
